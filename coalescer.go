@@ -42,12 +42,12 @@ func NewCoalescer[K comparable, V any](window time.Duration, fetcher Fetcher[K, 
 }
 
 func (c *Coalescer[K, V]) Start(ctx context.Context) {
-	timer := time.NewTimer(c.window)
-	defer timer.Stop()
+	ticker := time.NewTicker(c.window)
+	defer ticker.Stop()
 
 	for {
 		select {
-		case <-timer.C:
+		case <-ticker.C:
 			c.Flush(ctx)
 		case <-ctx.Done():
 			c.mu.Lock()
