@@ -112,14 +112,12 @@ func (c *Coalescer[K, V]) Flush(ctx context.Context) {
 				}
 			case <-fetchReady:
 				// If the caller's context was also cancelled, prefer the cancellation error.
-				select {
-				case <-req.ctx.Done():
+				if req.ctx.Err() != nil {
 					for _, key := range req.keys {
 						errs[key] = req.ctx.Err()
 					}
 					req.result <- Result[K, V]{Values: values, Errors: errs}
 					return
-				default:
 				}
 
 				if fetchErr != nil {
