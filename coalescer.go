@@ -138,8 +138,11 @@ func (c *Coalescer[K, V]) Flush(ctx context.Context) {
 }
 
 // Fetch enqueues a request for the given keys and blocks until the coalescer
-// delivers the result. It returns a map of found values and the first error
-// encountered, or nil if all keys were resolved successfully.
+// delivers the result. It returns a map of found keys to their values. Keys
+// absent from the fetcher's response are simply absent from the returned map.
+// If any key encounters an error (e.g. context cancellation or a fetcher error),
+// Fetch returns nil and that error; within a single batch all keys share the
+// same error so only one error value is possible per call.
 func (c *Coalescer[K, V]) Fetch(ctx context.Context, keys ...K) (map[K]V, error) {
 	c.mu.Lock()
 	ch := make(chan map[K]keyResult[V], 1)
