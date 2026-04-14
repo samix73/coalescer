@@ -36,11 +36,6 @@ func errorFetcher(fetchErr error) Fetcher[string, string] {
 	}
 }
 
-// collectResult reads the single result from the result channel.
-func collectResult(ch <-chan Result[string, string]) Result[string, string] {
-	return <-ch
-}
-
 // TestFetch_HappyPath verifies that a normal fetch delivers the expected values.
 func TestFetch_HappyPath(t *testing.T) {
 	c := NewCoalescer[string, string](10*time.Millisecond, happyFetcher)
@@ -49,21 +44,20 @@ func TestFetch_HappyPath(t *testing.T) {
 
 	go c.Start(ctx)
 
-	ch := c.Fetch(context.Background(), "a", "b", "c")
-	result := collectResult(ch)
+	values, err := c.Fetch(context.Background(), "a", "b", "c")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
 
 	for _, key := range []string{"a", "b", "c"} {
-		if err, ok := result.Errors[key]; ok {
-			t.Errorf("unexpected error for key %q: %v", key, err)
-		}
-		if v, ok := result.Values[key]; !ok || v != key {
+		if v, ok := values[key]; !ok || v != key {
 			t.Errorf("key %q: want value %q, got %q", key, key, v)
 		}
 	}
 }
 
 // TestFetch_ContextCancelledBeforeFlush cancels the caller's context before the
-// flush window fires and verifies that the result channel returns ctx.Err().
+// flush window fires and verifies that Fetch returns ctx.Err().
 func TestFetch_ContextCancelledBeforeFlush(t *testing.T) {
 	// Use a long window so the flush won't fire naturally during the test.
 	c := NewCoalescer[string, string](10*time.Second, slowFetcher(5*time.Second))
@@ -72,7 +66,19 @@ func TestFetch_ContextCancelledBeforeFlush(t *testing.T) {
 	go c.Start(startCtx)
 
 	reqCtx, reqCancel := context.WithCancel(context.Background())
-	ch := c.Fetch(reqCtx, "x", "y")
+
+	type fetchOut struct {
+		values map[string]string
+		err    error
+	}
+	out := make(chan fetchOut, 1)
+	go func() {
+		v, e := c.Fetch(reqCtx, "x", "y")
+		out <- fetchOut{v, e}
+	}()
+
+	// Give the Fetch goroutine time to enqueue before triggering flush.
+	time.Sleep(time.Millisecond)
 
 	// Cancel before the flush fires.
 	reqCancel()
@@ -80,12 +86,9 @@ func TestFetch_ContextCancelledBeforeFlush(t *testing.T) {
 	// Manually trigger flush so the goroutines are spawned.
 	go c.Flush(startCtx)
 
-	result := collectResult(ch)
-
-	for _, key := range []string{"x", "y"} {
-		if !errors.Is(result.Errors[key], context.Canceled) {
-			t.Errorf("key %q: want context.Canceled, got %v", key, result.Errors[key])
-		}
+	result := <-out
+	if !errors.Is(result.err, context.Canceled) {
+		t.Errorf("want context.Canceled, got %v", result.err)
 	}
 }
 
@@ -110,7 +113,19 @@ func TestFetch_ContextCancelledDuringFetch(t *testing.T) {
 	defer startCancel()
 
 	reqCtx, reqCancel := context.WithCancel(context.Background())
-	ch := c.Fetch(reqCtx, "p", "q")
+
+	type fetchOut struct {
+		values map[string]string
+		err    error
+	}
+	out := make(chan fetchOut, 1)
+	go func() {
+		v, e := c.Fetch(reqCtx, "p", "q")
+		out <- fetchOut{v, e}
+	}()
+
+	// Give the Fetch goroutine time to enqueue before triggering flush.
+	time.Sleep(time.Millisecond)
 
 	go c.Flush(startCtx)
 
@@ -118,12 +133,9 @@ func TestFetch_ContextCancelledDuringFetch(t *testing.T) {
 	<-fetchStarted
 	reqCancel()
 
-	result := collectResult(ch)
-
-	for _, key := range []string{"p", "q"} {
-		if !errors.Is(result.Errors[key], context.Canceled) {
-			t.Errorf("key %q: want context.Canceled, got %v", key, result.Errors[key])
-		}
+	result := <-out
+	if !errors.Is(result.err, context.Canceled) {
+		t.Errorf("want context.Canceled, got %v", result.err)
 	}
 
 	// Unblock the fetcher so no goroutines are left hanging.
@@ -138,15 +150,14 @@ func TestFetch_FetcherError(t *testing.T) {
 	defer cancel()
 	go c.Start(ctx)
 
-	ch := c.Fetch(context.Background(), "a")
-	result := collectResult(ch)
-
-	if !errors.Is(result.Errors["a"], sentinel) {
-		t.Errorf("want sentinel error, got %v", result.Errors["a"])
+	_, err := c.Fetch(context.Background(), "a")
+	if !errors.Is(err, sentinel) {
+		t.Errorf("want sentinel error, got %v", err)
 	}
 }
 
-// TestFetch_NotFound verifies that keys absent from the fetcher result map get ErrNotFound.
+// TestFetch_NotFound verifies that keys absent from the fetcher result map are
+// simply absent from the returned values map.
 func TestFetch_NotFound(t *testing.T) {
 	fetcher := func(_ context.Context, _ []string) (map[string]string, error) {
 		return map[string]string{}, nil // return empty map — nothing found
@@ -156,11 +167,12 @@ func TestFetch_NotFound(t *testing.T) {
 	defer cancel()
 	go c.Start(ctx)
 
-	ch := c.Fetch(context.Background(), "missing")
-	result := collectResult(ch)
-
-	if !errors.Is(result.Errors["missing"], ErrNotFound) {
-		t.Errorf("want ErrNotFound, got %v", result.Errors["missing"])
+	values, err := c.Fetch(context.Background(), "missing")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if _, ok := values["missing"]; ok {
+		t.Errorf("expected key \"missing\" to be absent from values map")
 	}
 }
 
@@ -173,24 +185,20 @@ func TestFetch_MultipleCallersSameKey(t *testing.T) {
 	go c.Start(ctx)
 
 	const n = 5
-	channels := make([]<-chan Result[string, string], n)
-	for i := range n {
-		channels[i] = c.Fetch(context.Background(), "shared")
-	}
-
 	var wg sync.WaitGroup
-	for i, ch := range channels {
+	for i := range n {
 		wg.Add(1)
-		go func(idx int, ch <-chan Result[string, string]) {
+		go func(idx int) {
 			defer wg.Done()
-			result := collectResult(ch)
-			if err, ok := result.Errors["shared"]; ok {
+			values, err := c.Fetch(context.Background(), "shared")
+			if err != nil {
 				t.Errorf("caller %d: unexpected error: %v", idx, err)
+				return
 			}
-			if v, ok := result.Values["shared"]; !ok || v != "shared" {
+			if v, ok := values["shared"]; !ok || v != "shared" {
 				t.Errorf("caller %d: want \"shared\", got %q", idx, v)
 			}
-		}(i, ch)
+		}(i)
 	}
 
 	wg.Wait()
@@ -204,14 +212,22 @@ func TestFetch_StartContextCancelled(t *testing.T) {
 
 	go c.Start(startCtx)
 
-	ch := c.Fetch(context.Background(), "z")
+	type fetchOut struct {
+		values map[string]string
+		err    error
+	}
+	out := make(chan fetchOut, 1)
+	go func() {
+		v, e := c.Fetch(context.Background(), "z")
+		out <- fetchOut{v, e}
+	}()
 
 	// Give Start a moment to register the request, then cancel it.
 	time.Sleep(10 * time.Millisecond)
 	startCancel()
 
-	result := collectResult(ch)
-	if !errors.Is(result.Errors["z"], context.Canceled) {
-		t.Errorf("want context.Canceled, got %v", result.Errors["z"])
+	result := <-out
+	if !errors.Is(result.err, context.Canceled) {
+		t.Errorf("want context.Canceled, got %v", result.err)
 	}
 }

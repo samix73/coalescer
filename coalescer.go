@@ -2,28 +2,24 @@ package coalescer
 
 import (
 	"context"
-	"errors"
 	"maps"
 	"slices"
 	"sync"
 	"time"
 )
 
-var (
-	ErrNotFound = errors.New("not found")
-)
-
 type Fetcher[K comparable, V any] func(ctx context.Context, keys []K) (map[K]V, error)
 
-type Result[K comparable, V any] struct {
-	Values map[K]V
-	Errors map[K]error
+// keyResult holds the outcome for a single key: either a value or an error.
+type keyResult[V any] struct {
+	value V
+	err   error
 }
 
 type batchRequest[K comparable, V any] struct {
 	ctx    context.Context
 	keys   []K
-	result chan Result[K, V]
+	result chan map[K]keyResult[V]
 }
 
 type Coalescer[K comparable, V any] struct {
@@ -55,11 +51,11 @@ func (c *Coalescer[K, V]) Start(ctx context.Context) {
 			c.pending = nil
 			c.mu.Unlock()
 			for _, req := range pending {
-				errs := make(map[K]error, len(req.keys))
+				results := make(map[K]keyResult[V], len(req.keys))
 				for _, key := range req.keys {
-					errs[key] = ctx.Err()
+					results[key] = keyResult[V]{err: ctx.Err()}
 				}
-				req.result <- Result[K, V]{Values: make(map[K]V), Errors: errs}
+				req.result <- results
 				close(req.result)
 			}
 			return
@@ -102,58 +98,65 @@ func (c *Coalescer[K, V]) Flush(ctx context.Context) {
 			defer wg.Done()
 			defer close(req.result)
 
-			errs := make(map[K]error, len(req.keys))
-			values := make(map[K]V, len(req.keys))
+			results := make(map[K]keyResult[V], len(req.keys))
 
 			select {
 			case <-req.ctx.Done():
 				for _, key := range req.keys {
-					errs[key] = req.ctx.Err()
+					results[key] = keyResult[V]{err: req.ctx.Err()}
 				}
 			case <-fetchReady:
 				// If the caller's context was also cancelled, prefer the cancellation error.
 				if req.ctx.Err() != nil {
 					for _, key := range req.keys {
-						errs[key] = req.ctx.Err()
+						results[key] = keyResult[V]{err: req.ctx.Err()}
 					}
-					req.result <- Result[K, V]{Values: values, Errors: errs}
+					req.result <- results
 					return
 				}
 
 				if fetchErr != nil {
 					for _, key := range req.keys {
-						errs[key] = fetchErr
+						results[key] = keyResult[V]{err: fetchErr}
 					}
-					req.result <- Result[K, V]{Values: values, Errors: errs}
+					req.result <- results
 					return
 				}
 
 				for _, key := range req.keys {
-					if value, ok := fetchResults[key]; ok {
-						values[key] = value
-					} else {
-						errs[key] = ErrNotFound
+					if v, ok := fetchResults[key]; ok {
+						results[key] = keyResult[V]{value: v}
 					}
 				}
 			}
 
-			req.result <- Result[K, V]{Values: values, Errors: errs}
+			req.result <- results
 		}(req)
 	}
 
 	wg.Wait()
 }
 
-func (c *Coalescer[K, V]) Fetch(ctx context.Context, keys ...K) <-chan Result[K, V] {
+// Fetch enqueues a request for the given keys and blocks until the coalescer
+// delivers the result. It returns a map of found values and the first error
+// encountered, or nil if all keys were resolved successfully.
+func (c *Coalescer[K, V]) Fetch(ctx context.Context, keys ...K) (map[K]V, error) {
 	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	results := make(chan Result[K, V], 1)
+	ch := make(chan map[K]keyResult[V], 1)
 	c.pending = append(c.pending, batchRequest[K, V]{
 		ctx:    ctx,
 		keys:   keys,
-		result: results,
+		result: ch,
 	})
+	c.mu.Unlock()
 
-	return results
+	items := <-ch
+	values := make(map[K]V, len(items))
+	for k, item := range items {
+		if item.err != nil {
+			return nil, item.err
+		}
+		values[k] = item.value
+	}
+	return values, nil
 }
