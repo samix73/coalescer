@@ -16,9 +16,8 @@ var (
 type Fetcher[K comparable, V any] func(ctx context.Context, keys []K) (map[K]V, error)
 
 type Result[K comparable, V any] struct {
-	Key   K
-	Value V
-	Err   error
+	Values map[K]V
+	Errors map[K]error
 }
 
 type batchRequest[K comparable, V any] struct {
@@ -56,9 +55,11 @@ func (c *Coalescer[K, V]) Start(ctx context.Context) {
 			c.pending = nil
 			c.mu.Unlock()
 			for _, req := range pending {
+				errs := make(map[K]error, len(req.keys))
 				for _, key := range req.keys {
-					req.result <- Result[K, V]{Key: key, Err: ctx.Err()}
+					errs[key] = ctx.Err()
 				}
+				req.result <- Result[K, V]{Values: make(map[K]V), Errors: errs}
 				close(req.result)
 			}
 			return
@@ -101,37 +102,44 @@ func (c *Coalescer[K, V]) Flush(ctx context.Context) {
 			defer wg.Done()
 			defer close(req.result)
 
+			errs := make(map[K]error, len(req.keys))
+			values := make(map[K]V, len(req.keys))
+
 			select {
 			case <-req.ctx.Done():
 				for _, key := range req.keys {
-					req.result <- Result[K, V]{Key: key, Err: req.ctx.Err()}
+					errs[key] = req.ctx.Err()
 				}
 			case <-fetchReady:
 				// If the caller's context was also cancelled, prefer the cancellation error.
 				select {
 				case <-req.ctx.Done():
 					for _, key := range req.keys {
-						req.result <- Result[K, V]{Key: key, Err: req.ctx.Err()}
+						errs[key] = req.ctx.Err()
 					}
+					req.result <- Result[K, V]{Values: values, Errors: errs}
 					return
 				default:
 				}
 
 				if fetchErr != nil {
 					for _, key := range req.keys {
-						req.result <- Result[K, V]{Key: key, Err: fetchErr}
+						errs[key] = fetchErr
 					}
+					req.result <- Result[K, V]{Values: values, Errors: errs}
 					return
 				}
 
 				for _, key := range req.keys {
 					if value, ok := fetchResults[key]; ok {
-						req.result <- Result[K, V]{Key: key, Value: value}
+						values[key] = value
 					} else {
-						req.result <- Result[K, V]{Key: key, Err: ErrNotFound}
+						errs[key] = ErrNotFound
 					}
 				}
 			}
+
+			req.result <- Result[K, V]{Values: values, Errors: errs}
 		}(req)
 	}
 
@@ -142,7 +150,7 @@ func (c *Coalescer[K, V]) Fetch(ctx context.Context, keys ...K) <-chan Result[K,
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	results := make(chan Result[K, V], len(keys))
+	results := make(chan Result[K, V], 1)
 	c.pending = append(c.pending, batchRequest[K, V]{
 		ctx:    ctx,
 		keys:   keys,

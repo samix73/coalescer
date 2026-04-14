@@ -36,13 +36,9 @@ func errorFetcher(fetchErr error) Fetcher[string, string] {
 	}
 }
 
-// collectResults drains the result channel into a map of key→Result.
-func collectResults(ch <-chan Result[string, string]) map[string]Result[string, string] {
-	out := make(map[string]Result[string, string])
-	for r := range ch {
-		out[r.Key] = r
-	}
-	return out
+// collectResult reads the single result from the result channel.
+func collectResult(ch <-chan Result[string, string]) Result[string, string] {
+	return <-ch
 }
 
 // TestFetch_HappyPath verifies that a normal fetch delivers the expected values.
@@ -54,19 +50,14 @@ func TestFetch_HappyPath(t *testing.T) {
 	go c.Start(ctx)
 
 	ch := c.Fetch(context.Background(), "a", "b", "c")
-	results := collectResults(ch)
+	result := collectResult(ch)
 
 	for _, key := range []string{"a", "b", "c"} {
-		r, ok := results[key]
-		if !ok {
-			t.Errorf("missing result for key %q", key)
-			continue
+		if err, ok := result.Errors[key]; ok {
+			t.Errorf("unexpected error for key %q: %v", key, err)
 		}
-		if r.Err != nil {
-			t.Errorf("unexpected error for key %q: %v", key, r.Err)
-		}
-		if r.Value != key {
-			t.Errorf("key %q: want value %q, got %q", key, key, r.Value)
+		if v, ok := result.Values[key]; !ok || v != key {
+			t.Errorf("key %q: want value %q, got %q", key, key, v)
 		}
 	}
 }
@@ -89,16 +80,11 @@ func TestFetch_ContextCancelledBeforeFlush(t *testing.T) {
 	// Manually trigger flush so the goroutines are spawned.
 	go c.Flush(startCtx)
 
-	results := collectResults(ch)
+	result := collectResult(ch)
 
 	for _, key := range []string{"x", "y"} {
-		r, ok := results[key]
-		if !ok {
-			t.Errorf("missing result for key %q", key)
-			continue
-		}
-		if !errors.Is(r.Err, context.Canceled) {
-			t.Errorf("key %q: want context.Canceled, got %v", key, r.Err)
+		if !errors.Is(result.Errors[key], context.Canceled) {
+			t.Errorf("key %q: want context.Canceled, got %v", key, result.Errors[key])
 		}
 	}
 }
@@ -132,16 +118,11 @@ func TestFetch_ContextCancelledDuringFetch(t *testing.T) {
 	<-fetchStarted
 	reqCancel()
 
-	results := collectResults(ch)
+	result := collectResult(ch)
 
 	for _, key := range []string{"p", "q"} {
-		r, ok := results[key]
-		if !ok {
-			t.Errorf("missing result for key %q", key)
-			continue
-		}
-		if !errors.Is(r.Err, context.Canceled) {
-			t.Errorf("key %q: want context.Canceled, got %v", key, r.Err)
+		if !errors.Is(result.Errors[key], context.Canceled) {
+			t.Errorf("key %q: want context.Canceled, got %v", key, result.Errors[key])
 		}
 	}
 
@@ -158,14 +139,10 @@ func TestFetch_FetcherError(t *testing.T) {
 	go c.Start(ctx)
 
 	ch := c.Fetch(context.Background(), "a")
-	results := collectResults(ch)
+	result := collectResult(ch)
 
-	r, ok := results["a"]
-	if !ok {
-		t.Fatal("missing result for key \"a\"")
-	}
-	if !errors.Is(r.Err, sentinel) {
-		t.Errorf("want sentinel error, got %v", r.Err)
+	if !errors.Is(result.Errors["a"], sentinel) {
+		t.Errorf("want sentinel error, got %v", result.Errors["a"])
 	}
 }
 
@@ -180,14 +157,10 @@ func TestFetch_NotFound(t *testing.T) {
 	go c.Start(ctx)
 
 	ch := c.Fetch(context.Background(), "missing")
-	results := collectResults(ch)
+	result := collectResult(ch)
 
-	r, ok := results["missing"]
-	if !ok {
-		t.Fatal("missing result for key \"missing\"")
-	}
-	if !errors.Is(r.Err, ErrNotFound) {
-		t.Errorf("want ErrNotFound, got %v", r.Err)
+	if !errors.Is(result.Errors["missing"], ErrNotFound) {
+		t.Errorf("want ErrNotFound, got %v", result.Errors["missing"])
 	}
 }
 
@@ -210,17 +183,12 @@ func TestFetch_MultipleCallersSameKey(t *testing.T) {
 		wg.Add(1)
 		go func(idx int, ch <-chan Result[string, string]) {
 			defer wg.Done()
-			results := collectResults(ch)
-			r, ok := results["shared"]
-			if !ok {
-				t.Errorf("caller %d: missing result for key \"shared\"", idx)
-				return
+			result := collectResult(ch)
+			if err, ok := result.Errors["shared"]; ok {
+				t.Errorf("caller %d: unexpected error: %v", idx, err)
 			}
-			if r.Err != nil {
-				t.Errorf("caller %d: unexpected error: %v", idx, r.Err)
-			}
-			if r.Value != "shared" {
-				t.Errorf("caller %d: want \"shared\", got %q", idx, r.Value)
+			if v, ok := result.Values["shared"]; !ok || v != "shared" {
+				t.Errorf("caller %d: want \"shared\", got %q", idx, v)
 			}
 		}(i, ch)
 	}
@@ -242,12 +210,8 @@ func TestFetch_StartContextCancelled(t *testing.T) {
 	time.Sleep(10 * time.Millisecond)
 	startCancel()
 
-	results := collectResults(ch)
-	r, ok := results["z"]
-	if !ok {
-		t.Fatal("missing result for key \"z\"")
-	}
-	if !errors.Is(r.Err, context.Canceled) {
-		t.Errorf("want context.Canceled, got %v", r.Err)
+	result := collectResult(ch)
+	if !errors.Is(result.Errors["z"], context.Canceled) {
+		t.Errorf("want context.Canceled, got %v", result.Errors["z"])
 	}
 }
