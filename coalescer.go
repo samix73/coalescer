@@ -22,6 +22,7 @@ type Result[K comparable, V any] struct {
 }
 
 type batchRequest[K comparable, V any] struct {
+	ctx    context.Context
 	keys   []K
 	result chan Result[K, V]
 }
@@ -82,63 +83,68 @@ func (c *Coalescer[K, V]) Flush(ctx context.Context) {
 		}
 	}
 
-	results, err := c.fetcher(ctx, slices.Collect(maps.Keys(keysSet)))
-	if err != nil {
-		for _, req := range pending { // if fetcher fails, we need to send the error to all pending requests
-			for _, key := range req.keys {
-				req.result <- Result[K, V]{
-					Key: key,
-					Err: err,
+	var (
+		fetchResults map[K]V
+		fetchErr     error
+		fetchReady   = make(chan struct{})
+	)
+
+	go func() {
+		fetchResults, fetchErr = c.fetcher(ctx, slices.Collect(maps.Keys(keysSet)))
+		close(fetchReady)
+	}()
+
+	var wg sync.WaitGroup
+	for _, req := range pending {
+		wg.Add(1)
+		go func(req batchRequest[K, V]) {
+			defer wg.Done()
+			defer close(req.result)
+
+			select {
+			case <-req.ctx.Done():
+				for _, key := range req.keys {
+					req.result <- Result[K, V]{Key: key, Err: req.ctx.Err()}
+				}
+			case <-fetchReady:
+				// If the caller's context was also cancelled, prefer the cancellation error.
+				select {
+				case <-req.ctx.Done():
+					for _, key := range req.keys {
+						req.result <- Result[K, V]{Key: key, Err: req.ctx.Err()}
+					}
+					return
+				default:
+				}
+
+				if fetchErr != nil {
+					for _, key := range req.keys {
+						req.result <- Result[K, V]{Key: key, Err: fetchErr}
+					}
+					return
+				}
+
+				for _, key := range req.keys {
+					if value, ok := fetchResults[key]; ok {
+						req.result <- Result[K, V]{Key: key, Value: value}
+					} else {
+						req.result <- Result[K, V]{Key: key, Err: ErrNotFound}
+					}
 				}
 			}
-			close(req.result)
-		}
-
-		return
+		}(req)
 	}
 
-	for key, value := range results {
-		requestsIndex, ok := keysSet[key]
-		if !ok {
-			continue // this should not happen, but just in case
-		}
-
-		for _, reqIndex := range requestsIndex {
-			req := pending[reqIndex]
-			req.result <- Result[K, V]{
-				Key:   key,
-				Value: value,
-				Err:   nil,
-			}
-		}
-	}
-
-	// Scan for not found keys and send an error for them
-	for key, keyIndexes := range keysSet {
-		if _, found := results[key]; found {
-			continue
-		}
-
-		for _, reqIndex := range keyIndexes {
-			req := pending[reqIndex]
-			req.result <- Result[K, V]{
-				Key: key,
-				Err: ErrNotFound,
-			}
-		}
-	}
-
-	for _, req := range pending {
-		close(req.result)
-	}
+	wg.Wait()
 }
 
-func (c *Coalescer[K, V]) Fetch(keys ...K) <-chan Result[K, V] {
+func (c *Coalescer[K, V]) Fetch(ctx context.Context, keys ...K) <-chan Result[K, V] {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
 	results := make(chan Result[K, V], len(keys))
 	c.pending = append(c.pending, batchRequest[K, V]{
+		ctx:    ctx,
 		keys:   keys,
 		result: results,
 	})
