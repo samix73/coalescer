@@ -29,7 +29,7 @@ Callers enqueue keys with `Fetch(keys...)` and receive a per-request result chan
   - Immediately flushes pending requests.
   - Useful for tests or low-latency paths.
 
-- `func (c *Coalescer[K, V]) Fetch(keys ...K) <-chan Result[K, V]`
+- `func (c *Coalescer[K, V]) Fetch(ctx context.Context, keys ...K) <-chan Result[K, V]`
   - Enqueues a request and returns a buffered result channel.
   - Channel is closed after all requested keys have a result.
 
@@ -82,7 +82,7 @@ func main() {
 	go c.Start(ctx)
 
 	// Request a small batch from one caller.
-	results := c.Fetch(1, 3, 99)
+	results := c.Fetch(context.Background(), 1, 3, 99)
 	for r := range results {
 		switch {
 		case errors.Is(r.Err, ErrNotFound):
