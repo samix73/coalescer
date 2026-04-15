@@ -7,7 +7,7 @@ This package provides a generic, time-windowed request coalescer for batched fet
 
 It lets multiple callers enqueue key-based lookups and resolves them together in one `fetcher` call per window. The goal is to reduce duplicate work and upstream load (for example: DB/API/cache lookups).
 
-Callers enqueue keys with `Fetch(keys...)` and receive a per-request result channel. A background loop (`Start(ctx)`) flushes pending requests every `window` duration, de-duplicates keys across all queued requests, invokes `fetcher(ctx, uniqueKeys)` once for the batch, and fans the results back to each request channel.
+Callers enqueue keys with `Fetch(ctx, keys...)` and receive a per-request result channel. A background loop (`Start(ctx)`) flushes pending requests every `window` duration, de-duplicates keys across all queued requests, invokes `fetcher(ctx, uniqueKeys)` once for the batch, and fans the results back to each request channel.
 
 ## API Overview
 
@@ -101,8 +101,8 @@ func main() {
 Multiple callers within the same flush window are grouped into one fetch:
 
 ```go
-chA := c.Fetch(1, 2)
-chB := c.Fetch(2, 3)
+chA := c.Fetch(ctx, 1, 2)
+chB := c.Fetch(ctx, 2, 3)
 // After the next flush, fetcher sees unique keys roughly like: [1,2,3].
 ```
 
