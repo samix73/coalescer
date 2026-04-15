@@ -10,13 +10,17 @@ import (
 )
 
 var (
+	// ErrNotFound is returned when a key is not found in the fetch results.
 	ErrNotFound = errors.New("not found")
 )
 
+// Fetcher is a function type that defines the signature for fetching values based on a slice of keys.
 type Fetcher[K comparable, V any] func(ctx context.Context, keys []K) (map[K]V, error)
 
+// FetchResult represents the outcome of fetching multiple keys, containing a slice of Result structs, each representing the result of fetching a single key.
 type FetchResult[K comparable, V any] = []Result[K, V]
 
+// Result represents the outcome of fetching a single key, including the key, its corresponding value (if found), and any error that occurred during the fetch operation.
 type Result[K comparable, V any] struct {
 	Key   K
 	Value V
