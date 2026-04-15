@@ -36,13 +36,43 @@ func errorFetcher(fetchErr error) Fetcher[string, string] {
 	}
 }
 
-// collectResults drains the result channel into a map of key→Result.
-func collectResults(ch <-chan Result[string, string]) map[string]Result[string, string] {
+func collectResults(results FetchResult[string, string]) map[string]Result[string, string] {
 	out := make(map[string]Result[string, string])
-	for r := range ch {
+	for _, r := range results {
 		out[r.Key] = r
 	}
 	return out
+}
+
+func awaitFetch(t *testing.T, ch <-chan FetchResult[string, string]) FetchResult[string, string] {
+	t.Helper()
+
+	select {
+	case results := <-ch:
+		return results
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out waiting for Fetch result")
+		return nil
+	}
+}
+
+func waitForPending(t *testing.T, c *Coalescer[string, string], want int) {
+	t.Helper()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		c.mu.Lock()
+		pending := len(c.pending)
+		c.mu.Unlock()
+
+		if pending >= want {
+			return
+		}
+
+		time.Sleep(time.Millisecond)
+	}
+
+	t.Fatalf("timed out waiting for pending requests: want >= %d", want)
 }
 
 // TestFetch_HappyPath verifies that a normal fetch delivers the expected values.
@@ -53,8 +83,12 @@ func TestFetch_HappyPath(t *testing.T) {
 
 	go c.Start(ctx)
 
-	ch := c.Fetch(context.Background(), "a", "b", "c")
-	results := collectResults(ch)
+	resultCh := make(chan FetchResult[string, string], 1)
+	go func() {
+		resultCh <- c.Fetch(context.Background(), "a", "b", "c")
+	}()
+
+	results := collectResults(awaitFetch(t, resultCh))
 
 	for _, key := range []string{"a", "b", "c"} {
 		r, ok := results[key]
@@ -81,7 +115,11 @@ func TestFetch_ContextCancelledBeforeFlush(t *testing.T) {
 	go c.Start(startCtx)
 
 	reqCtx, reqCancel := context.WithCancel(context.Background())
-	ch := c.Fetch(reqCtx, "x", "y")
+	resultCh := make(chan FetchResult[string, string], 1)
+	go func() {
+		resultCh <- c.Fetch(reqCtx, "x", "y")
+	}()
+	waitForPending(t, c, 1)
 
 	// Cancel before the flush fires.
 	reqCancel()
@@ -89,7 +127,7 @@ func TestFetch_ContextCancelledBeforeFlush(t *testing.T) {
 	// Manually trigger flush so the goroutines are spawned.
 	go c.Flush(startCtx)
 
-	results := collectResults(ch)
+	results := collectResults(awaitFetch(t, resultCh))
 
 	for _, key := range []string{"x", "y"} {
 		r, ok := results[key]
@@ -124,7 +162,11 @@ func TestFetch_ContextCancelledDuringFetch(t *testing.T) {
 	defer startCancel()
 
 	reqCtx, reqCancel := context.WithCancel(context.Background())
-	ch := c.Fetch(reqCtx, "p", "q")
+	resultCh := make(chan FetchResult[string, string], 1)
+	go func() {
+		resultCh <- c.Fetch(reqCtx, "p", "q")
+	}()
+	waitForPending(t, c, 1)
 
 	go c.Flush(startCtx)
 
@@ -132,7 +174,7 @@ func TestFetch_ContextCancelledDuringFetch(t *testing.T) {
 	<-fetchStarted
 	reqCancel()
 
-	results := collectResults(ch)
+	results := collectResults(awaitFetch(t, resultCh))
 
 	for _, key := range []string{"p", "q"} {
 		r, ok := results[key]
@@ -157,8 +199,11 @@ func TestFetch_FetcherError(t *testing.T) {
 	defer cancel()
 	go c.Start(ctx)
 
-	ch := c.Fetch(context.Background(), "a")
-	results := collectResults(ch)
+	resultCh := make(chan FetchResult[string, string], 1)
+	go func() {
+		resultCh <- c.Fetch(context.Background(), "a")
+	}()
+	results := collectResults(awaitFetch(t, resultCh))
 
 	r, ok := results["a"]
 	if !ok {
@@ -179,8 +224,11 @@ func TestFetch_NotFound(t *testing.T) {
 	defer cancel()
 	go c.Start(ctx)
 
-	ch := c.Fetch(context.Background(), "missing")
-	results := collectResults(ch)
+	resultCh := make(chan FetchResult[string, string], 1)
+	go func() {
+		resultCh <- c.Fetch(context.Background(), "missing")
+	}()
+	results := collectResults(awaitFetch(t, resultCh))
 
 	r, ok := results["missing"]
 	if !ok {
@@ -200,18 +248,22 @@ func TestFetch_MultipleCallersSameKey(t *testing.T) {
 	go c.Start(ctx)
 
 	const n = 5
-	channels := make([]<-chan Result[string, string], n)
+	results := make([]<-chan FetchResult[string, string], n)
 	for i := range n {
-		channels[i] = c.Fetch(context.Background(), "shared")
+		resultCh := make(chan FetchResult[string, string], 1)
+		results[i] = resultCh
+		go func(ch chan<- FetchResult[string, string]) {
+			ch <- c.Fetch(context.Background(), "shared")
+		}(resultCh)
 	}
 
 	var wg sync.WaitGroup
-	for i, ch := range channels {
+	for i, ch := range results {
 		wg.Add(1)
-		go func(idx int, ch <-chan Result[string, string]) {
+		go func(idx int, ch <-chan FetchResult[string, string]) {
 			defer wg.Done()
-			results := collectResults(ch)
-			r, ok := results["shared"]
+			res := collectResults(awaitFetch(t, ch))
+			r, ok := res["shared"]
 			if !ok {
 				t.Errorf("caller %d: missing result for key \"shared\"", idx)
 				return
@@ -236,13 +288,16 @@ func TestFetch_StartContextCancelled(t *testing.T) {
 
 	go c.Start(startCtx)
 
-	ch := c.Fetch(context.Background(), "z")
+	resultCh := make(chan FetchResult[string, string], 1)
+	go func() {
+		resultCh <- c.Fetch(context.Background(), "z")
+	}()
 
 	// Give Start a moment to register the request, then cancel it.
 	time.Sleep(10 * time.Millisecond)
 	startCancel()
 
-	results := collectResults(ch)
+	results := collectResults(awaitFetch(t, resultCh))
 	r, ok := results["z"]
 	if !ok {
 		t.Fatal("missing result for key \"z\"")
