@@ -1,4 +1,5 @@
 [![Go Reference](https://pkg.go.dev/badge/github.com/samix73/coalescer.svg)](https://pkg.go.dev/github.com/samix73/coalescer)
+[![CI](https://github.com/samix73/coalescer/actions/workflows/ci.yml/badge.svg)](https://github.com/samix73/coalescer/actions/workflows/ci.yml)
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/samix73/coalescer)
 
 # Coalescer
