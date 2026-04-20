@@ -106,7 +106,7 @@ func TestFetch_HappyPath(t *testing.T) {
 }
 
 // TestFetch_ContextCancelledBeforeFlush cancels the caller's context before the
-// flush window fires and verifies that the result channel returns ctx.Err().
+// flush window fires and verifies Fetch returns immediately with ctx.Err().
 func TestFetch_ContextCancelledBeforeFlush(t *testing.T) {
 	// Use a long window so the flush won't fire naturally during the test.
 	c := NewCoalescer[string, string](10*time.Second, slowFetcher(5*time.Second))
@@ -124,9 +124,6 @@ func TestFetch_ContextCancelledBeforeFlush(t *testing.T) {
 	// Cancel before the flush fires.
 	reqCancel()
 
-	// Manually trigger flush so the goroutines are spawned.
-	go c.Flush(startCtx)
-
 	results := collectResults(awaitFetch(t, resultCh))
 
 	for _, key := range []string{"x", "y"} {
@@ -138,6 +135,115 @@ func TestFetch_ContextCancelledBeforeFlush(t *testing.T) {
 		if !errors.Is(r.Err, context.Canceled) {
 			t.Errorf("key %q: want context.Canceled, got %v", key, r.Err)
 		}
+	}
+}
+
+// TestFlush_SkipsCancelledRequestsBeforeFetch verifies Flush does not pass keys
+// from already-cancelled requests to the fetcher.
+func TestFlush_SkipsCancelledRequestsBeforeFetch(t *testing.T) {
+	var (
+		mu       sync.Mutex
+		gotCalls [][]string
+	)
+
+	fetcher := func(_ context.Context, keys []string) (map[string]string, error) {
+		mu.Lock()
+		gotCalls = append(gotCalls, append([]string(nil), keys...))
+		mu.Unlock()
+
+		result := make(map[string]string, len(keys))
+		for _, k := range keys {
+			result[k] = k
+		}
+		return result, nil
+	}
+
+	c := NewCoalescer[string, string](10*time.Second, fetcher)
+	startCtx, startCancel := context.WithCancel(context.Background())
+	defer startCancel()
+
+	cancelledCtx, cancelCancelledCtx := context.WithCancel(context.Background())
+	cancelledResultCh := make(chan FetchResult[string, string], 1)
+	go func() {
+		cancelledResultCh <- c.Fetch(cancelledCtx, "cancelled-key")
+	}()
+	waitForPending(t, c, 1)
+	cancelCancelledCtx()
+
+	activeResultCh := make(chan FetchResult[string, string], 1)
+	go func() {
+		activeResultCh <- c.Fetch(context.Background(), "active-key")
+	}()
+	waitForPending(t, c, 2)
+
+	c.Flush(startCtx)
+
+	cancelledResults := collectResults(awaitFetch(t, cancelledResultCh))
+	activeResults := collectResults(awaitFetch(t, activeResultCh))
+
+	cancelled, ok := cancelledResults["cancelled-key"]
+	if !ok {
+		t.Fatal("missing result for key \"cancelled-key\"")
+	}
+	if !errors.Is(cancelled.Err, context.Canceled) {
+		t.Errorf("want context.Canceled for cancelled-key, got %v", cancelled.Err)
+	}
+
+	active, ok := activeResults["active-key"]
+	if !ok {
+		t.Fatal("missing result for key \"active-key\"")
+	}
+	if active.Err != nil {
+		t.Errorf("unexpected error for active-key: %v", active.Err)
+	}
+	if active.Value != "active-key" {
+		t.Errorf("want active-key value, got %q", active.Value)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(gotCalls) != 1 {
+		t.Fatalf("fetcher call count: want 1, got %d", len(gotCalls))
+	}
+	if len(gotCalls[0]) != 1 || gotCalls[0][0] != "active-key" {
+		t.Fatalf("fetcher keys: want [active-key], got %v", gotCalls[0])
+	}
+}
+
+// TestFlush_AllRequestsCancelledSkipsFetch verifies Flush avoids calling the
+// fetcher when all pending requests are already cancelled.
+func TestFlush_AllRequestsCancelledSkipsFetch(t *testing.T) {
+	callCount := 0
+	fetcher := func(_ context.Context, keys []string) (map[string]string, error) {
+		callCount++
+		t.Fatalf("fetcher should not be called, got keys: %v", keys)
+		return nil, nil
+	}
+
+	c := NewCoalescer[string, string](10*time.Second, fetcher)
+	startCtx, startCancel := context.WithCancel(context.Background())
+	defer startCancel()
+
+	reqCtx, reqCancel := context.WithCancel(context.Background())
+	resultCh := make(chan FetchResult[string, string], 1)
+	go func() {
+		resultCh <- c.Fetch(reqCtx, "only-cancelled")
+	}()
+	waitForPending(t, c, 1)
+	reqCancel()
+
+	c.Flush(startCtx)
+
+	results := collectResults(awaitFetch(t, resultCh))
+	r, ok := results["only-cancelled"]
+	if !ok {
+		t.Fatal("missing result for key \"only-cancelled\"")
+	}
+	if !errors.Is(r.Err, context.Canceled) {
+		t.Errorf("want context.Canceled, got %v", r.Err)
+	}
+	if callCount != 0 {
+		t.Fatalf("fetcher call count: want 0, got %d", callCount)
 	}
 }
 

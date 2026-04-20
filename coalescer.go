@@ -91,80 +91,45 @@ func (c *Coalescer[K, V]) Flush(ctx context.Context) {
 		return
 	}
 
-	keysSet := make(map[K][]int) // maps key to index of batchRequest in pending
-	for i, req := range pending {
+	keysSet := make(map[K]struct{})
+	for _, req := range pending {
+		if req.ctx.Err() != nil {
+			continue
+		}
 		for _, key := range req.keys {
-			keysSet[key] = append(keysSet[key], i)
+			keysSet[key] = struct{}{}
 		}
 	}
 
-	var (
-		fetchResults map[K]V
-		fetchErr     error
-		fetchReady   = make(chan struct{})
-	)
-
-	go func() {
+	var fetchResults map[K]V
+	var fetchErr error
+	if len(keysSet) > 0 {
 		fetchResults, fetchErr = c.fetcher(ctx, slices.Collect(maps.Keys(keysSet)))
-		close(fetchReady)
-	}()
-
-	var wg sync.WaitGroup
-	for _, req := range pending {
-		wg.Add(1)
-		go func(req batchRequest[K, V]) {
-			defer wg.Done()
-			defer close(req.result)
-
-			select {
-			case <-req.ctx.Done():
-				results := make(FetchResult[K, V], 0, len(req.keys))
-				for _, key := range req.keys {
-					results = append(results, Result[K, V]{Key: key, Err: req.ctx.Err()})
-				}
-
-				req.result <- results
-
-				return
-			case <-fetchReady:
-				// If the caller's context was also cancelled, prefer the cancellation error.
-				select {
-				case <-req.ctx.Done():
-					results := make(FetchResult[K, V], 0, len(req.keys))
-					for _, key := range req.keys {
-						results = append(results, Result[K, V]{Key: key, Err: req.ctx.Err()})
-					}
-					req.result <- results
-
-					return
-				default:
-				}
-
-				if fetchErr != nil {
-					results := make(FetchResult[K, V], 0, len(req.keys))
-					for _, key := range req.keys {
-						results = append(results, Result[K, V]{Key: key, Err: fetchErr})
-					}
-					req.result <- results
-
-					return
-				}
-
-				results := make(FetchResult[K, V], 0, len(req.keys))
-				for _, key := range req.keys {
-					if value, ok := fetchResults[key]; ok {
-						results = append(results, Result[K, V]{Key: key, Value: value})
-					} else {
-						results = append(results, Result[K, V]{Key: key, Err: ErrNotFound})
-					}
-				}
-
-				req.result <- results
-			}
-		}(req)
 	}
 
-	wg.Wait()
+	for _, req := range pending {
+		results := make(FetchResult[K, V], 0, len(req.keys))
+		if err := req.ctx.Err(); err != nil {
+			for _, key := range req.keys {
+				results = append(results, Result[K, V]{Key: key, Err: err})
+			}
+		} else if fetchErr != nil {
+			for _, key := range req.keys {
+				results = append(results, Result[K, V]{Key: key, Err: fetchErr})
+			}
+		} else {
+			for _, key := range req.keys {
+				if value, ok := fetchResults[key]; ok {
+					results = append(results, Result[K, V]{Key: key, Value: value})
+				} else {
+					results = append(results, Result[K, V]{Key: key, Err: ErrNotFound})
+				}
+			}
+		}
+
+		req.result <- results
+		close(req.result)
+	}
 }
 
 // Fetch adds a new fetch request to the coalescer.
@@ -183,5 +148,14 @@ func (c *Coalescer[K, V]) Fetch(ctx context.Context, keys ...K) FetchResult[K, V
 	})
 	c.mu.Unlock()
 
-	return <-results
+	select {
+	case <-ctx.Done():
+		res := make(FetchResult[K, V], 0, len(keys))
+		for _, key := range keys {
+			res = append(res, Result[K, V]{Key: key, Err: ctx.Err()})
+		}
+		return res
+	case res := <-results:
+		return res
+	}
 }
