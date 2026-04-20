@@ -1,5 +1,6 @@
 [![Go Reference](https://pkg.go.dev/badge/github.com/samix73/coalescer.svg)](https://pkg.go.dev/github.com/samix73/coalescer)
 [![CI](https://github.com/samix73/coalescer/actions/workflows/ci.yml/badge.svg)](https://github.com/samix73/coalescer/actions/workflows/ci.yml)
+[![codecov](https://codecov.io/gh/samix73/coalescer/graph/badge.svg)](https://codecov.io/gh/samix73/coalescer)
 [![Go Report Card](https://goreportcard.com/badge/github.com/samix73/coalescer)](https://goreportcard.com/report/github.com/samix73/coalescer)
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/samix73/coalescer)
 
