@@ -10,7 +10,7 @@ This package provides a generic, time-windowed request coalescer for batched fet
 
 It lets multiple callers enqueue key-based lookups and resolves them together in one `fetcher` call per window. The goal is to reduce duplicate work and upstream load (for example: DB/API/cache lookups).
 
-Callers enqueue keys with `Fetch(ctx, keys...)` and receive a per-request result channel. A background loop (`Start(ctx)`) flushes pending requests every `window` duration, de-duplicates keys across all queued requests, invokes `fetcher(ctx, uniqueKeys)` once for the batch, and fans the results back to each request channel.
+Callers enqueue keys with `Fetch(ctx, keys...)`, it blocks and returns the results of the fetch request once it has been processed. A background loop (`Start(ctx)`) flushes pending requests every `window` duration, de-duplicates keys across all queued requests, invokes `fetcher(ctx, uniqueKeys)` once for the batch, and fans the results back to each request.
 
 ## API Overview
 
@@ -32,9 +32,8 @@ Callers enqueue keys with `Fetch(ctx, keys...)` and receive a per-request result
   - Immediately flushes pending requests.
   - Useful for tests or low-latency paths.
 
-- `func (c *Coalescer[K, V]) Fetch(ctx context.Context, keys ...K) <-chan Result[K, V]`
-  - Enqueues a request and returns a buffered result channel.
-  - Channel is closed after all requested keys have a result.
+- `func (c *Coalescer[K, V]) Fetch(ctx context.Context, keys ...K) Result[K, V]`
+  - Enqueues a request and returns blocks until the results of the fetch request has been processed
 
 - `var ErrNotFound = errors.New("not found")`
   - Returned per key when fetcher does not include that key in its result map.
@@ -86,7 +85,7 @@ func main() {
 
 	// Request a small batch from one caller.
 	results := c.Fetch(context.Background(), 1, 3, 99)
-	for r := range results {
+	for _, r := range results {
 		switch {
 		case errors.Is(r.Err, ErrNotFound):
 			fmt.Printf("key=%d not found\n", r.Key)
@@ -104,8 +103,8 @@ func main() {
 Multiple callers within the same flush window are grouped into one fetch:
 
 ```go
-chA := c.Fetch(ctx, 1, 2)
-chB := c.Fetch(ctx, 2, 3)
+resA := c.Fetch(ctx, 1, 2)
+resB := c.Fetch(ctx, 2, 3)
 // After the next flush, fetcher sees unique keys roughly like: [1,2,3].
 ```
 
