@@ -213,9 +213,7 @@ func TestFlush_SkipsCancelledRequestsBeforeFetch(t *testing.T) {
 // TestFlush_AllRequestsCancelledSkipsFetch verifies Flush avoids calling the
 // fetcher when all pending requests are already cancelled.
 func TestFlush_AllRequestsCancelledSkipsFetch(t *testing.T) {
-	callCount := 0
 	fetcher := func(_ context.Context, keys []string) (map[string]string, error) {
-		callCount++
 		t.Fatalf("fetcher should not be called, got keys: %v", keys)
 		return nil, nil
 	}
@@ -241,9 +239,6 @@ func TestFlush_AllRequestsCancelledSkipsFetch(t *testing.T) {
 	}
 	if !errors.Is(r.Err, context.Canceled) {
 		t.Errorf("want context.Canceled, got %v", r.Err)
-	}
-	if callCount != 0 {
-		t.Fatalf("fetcher call count: want 0, got %d", callCount)
 	}
 }
 
